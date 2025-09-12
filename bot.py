@@ -38,7 +38,7 @@ def get_user_state_path(user_id: int) -> str:
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO #замените на DEBUG, чтобы увидеть все сообщения
+    level=logging.WARNING #замените на DEBUG, чтобы увидеть все сообщения
 )
 logger = logging.getLogger(__name__)
 
@@ -123,46 +123,64 @@ async def take_screenshot(page: Page, name: str):
 
 
 async def get_whatsapp_page(context: ContextTypes.DEFAULT_TYPE, user_id: int, force_new: bool = False) -> Page | None:
-    if force_new and 'browser' in context.bot_data and context.bot_data['browser'].is_connected():
-        logger.info("Принудительное закрытие существующего экземпляра браузера...")
-        await context.bot_data['browser'].close()
-        for key in ['browser', 'playwright_context', 'whatsapp_page']:
-            context.bot_data.pop(key, None)
+    user_data = context.user_data
 
-    if 'browser' in context.bot_data and context.bot_data['browser'].is_connected():
-        page = context.bot_data.get('whatsapp_page')
+    # Флаг для определения, нужна ли полная переинициализация Playwright
+    needs_full_reinitialization = force_new or \
+                                  'browser' not in user_data or \
+                                  not user_data['browser'].is_connected() or \
+                                  'playwright_context' not in user_data or \
+                                  user_data['playwright_context'] is None
+
+    if needs_full_reinitialization:
+        if 'browser' in user_data and user_data['browser'].is_connected():
+            logger.info("Закрытие существующего экземпляра браузера для пользователя %s перед полной переинициализацией.", user_id)
+            await user_data['browser'].close()
+        
+        logger.info("Полная инициализация нового экземпляра Playwright для пользователя %s...", user_id)
+        # Очищаем все связанные с Playwright данные пользователя
+        for key in ['browser', 'playwright_context', 'whatsapp_page']:
+            user_data.pop(key, None)
+
+        try:
+            p = await async_playwright().start()
+            browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled'])
+            user_data['browser'] = browser
+            user_state_path = get_user_state_path(user_id)
+            storage_state = user_state_path if os.path.exists(user_state_path) else None
+
+            pw_context = await browser.new_context(
+                storage_state=storage_state,
+                locale="ru-RU",
+                user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            )
+            user_data['playwright_context'] = pw_context
+
+            page = await pw_context.new_page()
+            user_data['whatsapp_page'] = page
+            return page
+        except Exception as e:
+            logger.error(f"Не удалось запустить Playwright для пользователя {user_id}: {e}")
+            return None
+    else:
+        # Если браузер и контекст существуют и действительны, пытаемся использовать существующую страницу или создать новую
+        pw_context = user_data['playwright_context']
+        page = user_data.get('whatsapp_page')
+
         if page and not page.is_closed():
-            logger.info("Используется существующая страница WhatsApp.")
+            logger.info("Используется существующая страница WhatsApp для пользователя %s.", user_id)
             return page
         
-        logger.info("Страница закрыта, создаем новую.")
-        pw_context = context.bot_data['playwright_context']
-        page = await pw_context.new_page()
-        context.bot_data['whatsapp_page'] = page
-        return page
-
-    logger.info("Запуск нового экземпляра Playwright...")
-    try:
-        p = await async_playwright().start()
-        browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled'])
-        context.bot_data['browser'] = browser
-        user_state_path = get_user_state_path(user_id)
-        storage_state = user_state_path if os.path.exists(user_state_path) else None
-
-        pw_context = await browser.new_context(
-            storage_state=storage_state,
-            locale="ru-RU",
-            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        )
-        context.bot_data['playwright_context'] = pw_context
-
-        
-        page = await pw_context.new_page()
-        context.bot_data['whatsapp_page'] = page
-        return page
-    except Exception as e:
-        logger.error(f"Не удалось запустить Playwright: {e}")
-        return None
+        logger.info("Страница закрыта для пользователя %s, создаем новую.", user_id)
+        try:
+            page = await pw_context.new_page()
+            user_data['whatsapp_page'] = page
+            return page
+        except Exception as e:
+            logger.error(f"Не удалось создать новую страницу Playwright для пользователя {user_id} в существующем контексте: {e}")
+            # Если создание новой страницы не удалось, это может указывать на проблему с контекстом, поэтому принудительно переинициализируем
+            logger.info("Попытка полной переинициализации Playwright для пользователя %s из-за ошибки создания страницы.", user_id)
+            return await get_whatsapp_page(context, user_id, force_new=True) # Рекурсивный вызов с force_new=True
 
 async def check_login_status(page: Page) -> bool:
     try:
@@ -173,7 +191,7 @@ async def check_login_status(page: Page) -> bool:
         return True
     except TimeoutError:
         logger.info("Сессия WhatsApp неактивна или не успела загрузиться.")
-        await page.screenshot(path="login_timeout.png")
+        await take_screenshot(page,"login_timeout")
         return False
 
 async def find_and_click_chat(page: Page, chat_name: str) -> bool:
@@ -251,7 +269,7 @@ async def login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 await page.wait_for_selector(chat_list_selector, timeout=60000)
                 await take_screenshot(page, "login_success")
                 user_state_path = get_user_state_path(update.effective_user.id)
-                await context.bot_data['playwright_context'].storage_state(path=user_state_path)
+                await context.user_data['playwright_context'].storage_state(path=user_state_path)
                 logger.info(f"Состояние сессии сохранено для пользователя {update.effective_user.id}.")
                 await update.message.reply_text("✅ Вход выполнен успешно! Сессия сохранена.")
 
