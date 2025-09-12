@@ -3,7 +3,6 @@ import re
 import asyncio
 import os
 import shlex
-import json
 import functools
 import logging
 import io
@@ -33,7 +32,7 @@ SUPPORT_URL = "https://rest-check.onrender.com/"
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    level=logging.WARNING #замените на DEBUG, чтобы увидеть все сообщения
 )
 logger = logging.getLogger(__name__)
 
@@ -97,22 +96,25 @@ def command_wrapper(func):
     return wrapped
 
 
-# --- PLAYWRIGHT HELPERS ---
+# Функция для дебага:
+# async def take_screenshot(page: Page, name: str):
+#     if not page or page.is_closed():
+#         logger.warning(f"Не удалось сделать скриншот '{name}': страница закрыта.")
+#         return
+#     try:
+#         screenshots_dir = "debug_screenshots"
+#         os.makedirs(screenshots_dir, exist_ok=True)
+#         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+#         safe_name = "".join(c for c in name if c.isalnum() or c in ('_', '-')).rstrip()
+#         path = os.path.join(screenshots_dir, f"{safe_name}_{timestamp}.png")
+#         await page.screenshot(path=path)
+#         logger.info(f"Скриншот для отладки сохранен: {path}")
+#     except Exception as e:
+#         logger.error(f"Не удалось сохранить скриншот '{name}': {e}")
 
 async def take_screenshot(page: Page, name: str):
-    if not page or page.is_closed():
-        logger.warning(f"Не удалось сделать скриншот '{name}': страница закрыта.")
-        return
-    try:
-        screenshots_dir = "debug_screenshots"
-        os.makedirs(screenshots_dir, exist_ok=True)
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        safe_name = "".join(c for c in name if c.isalnum() or c in ('_', '-')).rstrip()
-        path = os.path.join(screenshots_dir, f"{safe_name}_{timestamp}.png")
-        await page.screenshot(path=path)
-        logger.info(f"Скриншот для отладки сохранен: {path}")
-    except Exception as e:
-        logger.error(f"Не удалось сохранить скриншот '{name}': {e}")
+    pass
+
 
 async def get_whatsapp_page(context: ContextTypes.DEFAULT_TYPE, force_new: bool = False) -> Page | None:
     if force_new and 'browser' in context.bot_data and context.bot_data['browser'].is_connected():
