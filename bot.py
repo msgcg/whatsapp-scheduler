@@ -241,7 +241,7 @@ async def login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     try:
-        await msg.edit_text("🔄 Переход на WhatsApp Web...")
+        await msg.edit_text("🔄 Переход на WhatsApp Web (ждите, это долго)...")
         await page.goto("https://web.whatsapp.com/", timeout=60000)
         await take_screenshot(page, "login_goto")
 
