@@ -7,3 +7,4 @@ __pycache__/
 venv/
 debug_screenshots/
 temp_files/
+playwright_states/

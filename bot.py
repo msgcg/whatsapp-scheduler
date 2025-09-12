@@ -1,5 +1,6 @@
 # --- START OF FILE bot.py ---
 import re
+import glob
 import asyncio
 import os
 import shlex
@@ -18,7 +19,6 @@ from telegram.ext import (
     ContextTypes,
     CallbackQueryHandler,
 )
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from playwright.async_api import async_playwright, Page, TimeoutError
 
 # --- CONFIGURATION ---
@@ -27,9 +27,14 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 
-PLAYWRIGHT_STATE_PATH = "playwright_state.json"
-SUPPORT_REQUEST_INTERVAL = 3  # Запрашивать поддержку каждые 3 команды
+SUPPORT_REQUEST_INTERVAL = 5  # Запрашивать поддержку каждые команд
 SUPPORT_URL = "https://rest-check.onrender.com/"
+
+PLAYWRIGHT_STATE_DIR = "playwright_states"
+os.makedirs(PLAYWRIGHT_STATE_DIR, exist_ok=True)
+
+def get_user_state_path(user_id: int) -> str:
+    return os.path.join(PLAYWRIGHT_STATE_DIR, f"{user_id}.json")
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -117,7 +122,7 @@ async def take_screenshot(page: Page, name: str):
     pass
 
 
-async def get_whatsapp_page(context: ContextTypes.DEFAULT_TYPE, force_new: bool = False) -> Page | None:
+async def get_whatsapp_page(context: ContextTypes.DEFAULT_TYPE, user_id: int, force_new: bool = False) -> Page | None:
     if force_new and 'browser' in context.bot_data and context.bot_data['browser'].is_connected():
         logger.info("Принудительное закрытие существующего экземпляра браузера...")
         await context.bot_data['browser'].close()
@@ -141,14 +146,16 @@ async def get_whatsapp_page(context: ContextTypes.DEFAULT_TYPE, force_new: bool 
         p = await async_playwright().start()
         browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled'])
         context.bot_data['browser'] = browser
-        storage_state = PLAYWRIGHT_STATE_PATH if os.path.exists(PLAYWRIGHT_STATE_PATH) else None
-        
+        user_state_path = get_user_state_path(user_id)
+        storage_state = user_state_path if os.path.exists(user_state_path) else None
+
         pw_context = await browser.new_context(
             storage_state=storage_state,
             locale="ru-RU",
             user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         )
         context.bot_data['playwright_context'] = pw_context
+
         
         page = await pw_context.new_page()
         context.bot_data['whatsapp_page'] = page
@@ -161,7 +168,7 @@ async def check_login_status(page: Page) -> bool:
     try:
         search_box_selector = 'div[aria-placeholder="Поиск или новый чат"], div[aria-placeholder="Search or start a new chat"]'
         await page.wait_for_selector(search_box_selector, timeout=60000)
-        await take_screenshot(page, "login_success")
+        await take_screenshot(page, "login_success")      
         logger.info("Сессия WhatsApp активна.")
         return True
     except TimeoutError:
@@ -210,7 +217,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     force_new = 'new' in (context.args or [])
     msg = await update.message.reply_text("🔄 Инициализация браузера...")
-    page = await get_whatsapp_page(context, force_new=force_new)
+    page = await get_whatsapp_page(context, update.effective_user.id, force_new=force_new)
     if not page:
         await msg.edit_text("❌ Не удалось запустить браузер. Попробуйте снова.")
         return
@@ -243,9 +250,11 @@ async def login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             try:
                 await page.wait_for_selector(chat_list_selector, timeout=60000)
                 await take_screenshot(page, "login_success")
-                await context.bot_data['playwright_context'].storage_state(path=PLAYWRIGHT_STATE_PATH)
-                logger.info("Состояние сессии сохранено.")
+                user_state_path = get_user_state_path(update.effective_user.id)
+                await context.bot_data['playwright_context'].storage_state(path=user_state_path)
+                logger.info(f"Состояние сессии сохранено для пользователя {update.effective_user.id}.")
                 await update.message.reply_text("✅ Вход выполнен успешно! Сессия сохранена.")
+
             except TimeoutError:
                 await take_screenshot(page, "login_timeout")
                 await update.message.reply_text("❌ Не удалось найти список чатов. Сессия может быть неактивной.")
@@ -318,7 +327,7 @@ async def send_command_internal(update: Update, context: ContextTypes.DEFAULT_TY
     logger.info(f"Счетчик команд для {update.effective_user.id} увеличен до {context.user_data['request_count']}")
 
     msg_status = await message.reply_text("🔄 Проверяю сессию WhatsApp...")
-    page = await get_whatsapp_page(context)
+    page = await get_whatsapp_page(context, update.effective_user.id)
     if not page or not await check_login_status(page):
         await msg_status.edit_text("❌ Вы не вошли в WhatsApp. Пожалуйста, используйте команду /login.")
         return
@@ -462,13 +471,9 @@ async def send_command_internal(update: Update, context: ContextTypes.DEFAULT_TY
         except Exception as e:
             logger.error(f"Не удалось вернуться на главную страницу: {e}")
             # Если даже это не удалось, возможно, браузер "умер", лучше перезапустить
-            await get_whatsapp_page(context, force_new=True)
+            await get_whatsapp_page(context, update.effective_user.id, force_new=True)
             if timer_msg:
                 await timer_msg.edit_text("❌ Ошибка при сбросе состояния.")
-
-        if download_path and os.path.exists(download_path):
-            os.remove(download_path)
-            logger.info(f"Временный файл удален: {download_path}")
 
         if download_path and os.path.exists(download_path):
             os.remove(download_path)
@@ -485,6 +490,13 @@ async def send_command_wrapper(update: Update, context: ContextTypes.DEFAULT_TYP
 # --- MAIN ---
 
 def main() -> None:
+
+    for file in glob.glob(os.path.join(PLAYWRIGHT_STATE_DIR, "*.json")):
+        try:
+            os.remove(file)
+        except Exception as e:
+            logger.warning(f"Не удалось удалить старый state файл {file}: {e}")
+
     if not TELEGRAM_TOKEN:
         logger.critical("TELEGRAM_TOKEN не задан в .env файле.")
         return
