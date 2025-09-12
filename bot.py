@@ -251,6 +251,7 @@ async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await msg_status.edit_text(f"❌ Чат с именем '{chat_name}' не найден. Проверьте название и попробуйте снова.")
         return
 
+    download_path=None
     try:
         if attachment:
             await msg_status.edit_text("Подготовка файла к отправке...")
@@ -331,7 +332,23 @@ async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         logger.error(f"Ошибка при отправке: {e}")
         await msg_status.edit_text(f"❌ Не удалось отправить: {e}")
         await take_screenshot(page, "send_universal_error")
+    finally:
+        # --- ИЗМЕНЕНИЕ: Блок для сброса состояния и очистки ---
+        logger.info("Сброс состояния: возврат на главную страницу WhatsApp.")
+        try:
+            await asyncio.sleep(5)
+            await take_screenshot(page, "wap_before_updating")
+            # Возвращаемся на главный экран, чтобы следующая команда началась с чистого листа
+            await page.goto("https://web.whatsapp.com/", wait_until="domcontentloaded", timeout=15000)
+            await asyncio.sleep(1) # Даем странице мгновение на прогрузку
+        except Exception as e:
+            logger.error(f"Не удалось вернуться на главную страницу: {e}")
+            # Если даже это не удалось, возможно, браузер "умер", лучше перезапустить
+            await get_whatsapp_page(context, force_new=True)
 
+        if download_path and os.path.exists(download_path):
+            os.remove(download_path)
+            logger.info(f"Временный файл удален: {download_path}")
 
 # --- MAIN ---
 

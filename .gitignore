@@ -6,3 +6,4 @@ __pycache__/
 *.pyc
 venv/
 debug_screenshots/
+temp_files/
