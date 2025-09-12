@@ -9,13 +9,14 @@ import logging
 import io
 import datetime
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
     filters,
     ContextTypes,
+    CallbackQueryHandler,
 )
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from playwright.async_api import async_playwright, Page, TimeoutError
@@ -27,12 +28,73 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 
 PLAYWRIGHT_STATE_PATH = "playwright_state.json"
+SUPPORT_REQUEST_INTERVAL = 3  # Запрашивать поддержку каждые 3 команды
+SUPPORT_URL = "https://rest-check.onrender.com/"
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+
+# --- НОВЫЙ БЛОК: ЛОГИКА ЗАПРОСА ПОДДЕРЖКИ ---
+
+async def check_and_request_support(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    Проверяет, нужно ли запросить поддержку. Если да, отправляет сообщение и возвращает True.
+    """
+    user_id = update.effective_user.id
+    request_count = context.user_data.get('request_count', 0)
+
+    if request_count >= SUPPORT_REQUEST_INTERVAL:
+        keyboard = [
+            [
+                InlineKeyboardButton("🔗 Перейти на сайт", url=SUPPORT_URL),
+            ],
+            [
+                InlineKeyboardButton("✅ Я перешел и поддерживаю проект", callback_data="reset_support_counter"),
+            ],
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.effective_message.reply_text(
+            "🙏 **Пожалуйста, поддержите проект!**\n\n"
+            "Чтобы я мог и дальше работать, пожалуйста, перейдите на сайт нашего партнера. "
+            "Там вы найдете полезный инструмент для разделения счета в ресторане и посмотрите рекламу, которая помогает мне существовать.\n\n"
+            "Нажмите кнопку ниже, когда будете готовы продолжить.",
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+        return True  # Блокируем выполнение команды
+    return False # Разрешаем выполнение команды
+
+async def reset_support_counter_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Сбрасывает счетчик после того, как пользователь подтвердил переход.
+    """
+    query = update.callback_query
+    await query.answer()
+    
+    context.user_data['request_count'] = 0
+    logger.info(f"Счетчик сброшен для пользователя {update.effective_user.id}")
+    
+    await query.edit_message_text("😊 **Спасибо за вашу поддержку!**\n\nВы снова можете использовать команды.")
+
+def command_wrapper(func):
+    """Декоратор для увеличения счетчика и проверки лимита."""
+    @functools.wraps(func)
+    async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        if await check_and_request_support(update, context):
+            return
+        
+        # Выполняем команду
+        await func(update, context, *args, **kwargs)
+        
+        # Увеличиваем счетчик только после успешного вызова
+        context.user_data['request_count'] = context.user_data.get('request_count', 0) + 1
+        logger.info(f"Счетчик команд для {update.effective_user.id} увеличен до {context.user_data['request_count']}")
+
+    return wrapped
 
 
 # --- PLAYWRIGHT HELPERS ---
@@ -80,7 +142,7 @@ async def get_whatsapp_page(context: ContextTypes.DEFAULT_TYPE, force_new: bool 
         
         pw_context = await browser.new_context(
             storage_state=storage_state,
-            locale="ru-RU",  # Указываем предпочитаемые языки
+            locale="ru-RU",
             user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         )
         context.bot_data['playwright_context'] = pw_context
@@ -94,7 +156,6 @@ async def get_whatsapp_page(context: ContextTypes.DEFAULT_TYPE, force_new: bool 
 
 async def check_login_status(page: Page) -> bool:
     try:
-        # --- ИЗМЕНЕНИЕ: Добавлена проверка на английский и русский язык ---
         search_box_selector = 'div[aria-placeholder="Поиск или новый чат"], div[aria-placeholder="Search or start a new chat"]'
         await page.wait_for_selector(search_box_selector, timeout=5000)
         await take_screenshot(page, "login_success")
@@ -106,7 +167,6 @@ async def check_login_status(page: Page) -> bool:
         return False
 
 async def find_and_click_chat(page: Page, chat_name: str) -> bool:
-    # --- ИЗМЕНЕНИЕ: Добавлена проверка на английский и русский язык ---
     search_box_selector = 'div[aria-placeholder="Поиск или новый чат"], div[aria-placeholder="Search or start a new chat"]'
     try:
         logger.info(f"Поиск чата: '{chat_name}'")
@@ -130,6 +190,7 @@ async def find_and_click_chat(page: Page, chat_name: str) -> bool:
 
 # --- TELEGRAM COMMAND HANDLERS ---
 
+@command_wrapper
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "👋 **Привет! Я бот для отправки сообщений в WhatsApp.**\n\n"
@@ -142,6 +203,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         parse_mode='Markdown'
     )
 
+@command_wrapper
 async def login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     force_new = 'new' in (context.args or [])
     msg = await update.message.reply_text("🔄 Инициализация браузера...")
@@ -156,7 +218,6 @@ async def login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await take_screenshot(page, "login_goto")
 
         qr_selector = 'canvas[aria-label="Scan this QR code to link a device!"]'
-        # --- ИЗМЕНЕНИЕ: Добавлена проверка на английский и русский язык ---
         chat_list_selector = 'div[aria-placeholder="Поиск или новый чат"], div[aria-placeholder="Search or start a new chat"]'
 
         try:
@@ -179,15 +240,13 @@ async def login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             try:
                 await page.wait_for_selector(chat_list_selector, timeout=60000)
                 await take_screenshot(page, "login_success")
-
                 await context.bot_data['playwright_context'].storage_state(path=PLAYWRIGHT_STATE_PATH)
                 logger.info("Состояние сессии сохранено.")
                 await update.message.reply_text("✅ Вход выполнен успешно! Сессия сохранена.")
-
             except TimeoutError:
                 await take_screenshot(page, "login_timeout")
                 await update.message.reply_text("❌ Не удалось найти список чатов. Сессия может быть неактивной.")
-                await update.message.reply_document(document=open("debug_screenshots/login_timeout.png", "rb"))
+
 
         except TimeoutError:
             # Если QR не появился — проверяем, может уже вошли
@@ -197,20 +256,15 @@ async def login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             else:
                 await take_screenshot(page, "login_error")
                 await msg.edit_text("❌ Не удалось найти QR-код или вход не удался. Попробуйте снова.")
-                await update.message.reply_document(document=open("debug_screenshots/login_error.png", "rb"))
 
     except Exception as e:
         logger.error(f"Произошла ошибка при входе: {e}")
         await take_screenshot(page, "login_unhandled_exception")
         await update.message.reply_text(f"❌ Произошла ошибка: {e}\nПопробуйте /login снова.")
-        await update.message.reply_document(document=open("debug_screenshots/login_unhandled_exception.png", "rb"))
 
-
-async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def send_command_internal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
-    if not message:
-        return
-
+    if not message: return
     command_text = message.text or message.caption
     attachment = message.effective_attachment
 
@@ -219,26 +273,38 @@ async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     try:
         args = shlex.split(command_text)
-        if not (2 <= len(args) <= 3):
-            await message.reply_text(
-                "Неверный формат. Используйте:\n"
-                "`/send \"Имя чата\" \"Текст сообщения\"`\n"
-                "Или прикрепите файл и в подписи укажите:\n"
-                "`/send \"Имя чата\"`",
-                parse_mode='Markdown'
-            )
-            return
-            
-        chat_name = args[1].strip()
-        message_text = args[2].strip() if len(args) > 2 else None
+        chat_name = None
+        message_text = None
 
-        if not attachment and not message_text:
-            await message.reply_text("❌ Нечего отправлять. Укажите текст сообщения или прикрепите файл.")
-            return
+        # --- ИЗМЕНЕНИЕ: Раздельная проверка для файла и текста ---
+        if attachment: # Логика для файла
+            if len(args) != 2:
+                await message.reply_text(
+                    "Неверный формат для файла. Прикрепите файл и в подписи укажите:\n"
+                    "`/send \"Имя чата\"`",
+                    parse_mode='Markdown'
+                )
+                return
+            chat_name = args[1].strip()
+            message_text = None # Подпись к файлу не поддерживается
+        else: # Логика для текста
+            if len(args) != 3:
+                await message.reply_text(
+                    "Неверный формат для текста. Используйте:\n"
+                    "`/send \"Имя чата\" \"Текст сообщения\"`",
+                    parse_mode='Markdown'
+                )
+                return
+            chat_name = args[1].strip()
+            message_text = args[2].strip()
 
     except (ValueError, IndexError):
-        await message.reply_text("Ошибка в команде. Убедитесь, что имя чата заключено в двойные кавычки.")
+        await message.reply_text("Ошибка в команде. Убедитесь, что имя чата и текст заключено в двойные кавычки.")
         return
+
+    # Если проверка прошла, увеличиваем счетчик
+    context.user_data['request_count'] = context.user_data.get('request_count', 0) + 1
+    logger.info(f"Счетчик команд для {update.effective_user.id} увеличен до {context.user_data['request_count']}")
 
     msg_status = await message.reply_text("🔄 Проверяю сессию WhatsApp...")
     page = await get_whatsapp_page(context)
@@ -265,7 +331,6 @@ async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
             await msg_status.edit_text(f"Отправляю файл '{file_name}' в '{chat_name}'...")
             
-            # --- ИЗМЕНЕНИЕ: Добавлена проверка на английский и русский язык для кнопки "Прикрепить" ---
             attach_button_selector = '[aria-label="Прикрепить"], [aria-label="Attach"]'
             await page.locator(attach_button_selector).click()
             
@@ -273,10 +338,7 @@ async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await asyncio.sleep(2)
             await take_screenshot(page, "sendfile_attach_menu_fully_visible")
             
-            # --- НОВЫЙ ДВУЯЗЫЧНЫЙ КОД (ВОССТАНОВЛЕННАЯ ЛОГИКА) ---
             file_type = getattr(attachment, 'mime_type', '').lower()
-
-            # 1. Определяем русские и английские имена кнопок
             if 'image' in file_type or 'video' in file_type:
                 button_name_ru = "Фото и видео"
                 button_name_en = "Photos & videos"
@@ -284,30 +346,18 @@ async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 button_name_ru = "Документ"
                 button_name_en = "Document"
 
-            # 2. Находим родительский контейнер кнопки, используя регулярное выражение для поиска по обоим языкам.
-            #    Это аналог вашего page.get_by_role("button", name=button_name)
             button_container = page.get_by_role("button", name=re.compile(f"^({button_name_ru}|{button_name_en})$"))
-
-            # 3. Внутри этого контейнера находим ТОЧНЫЙ SPAN с текстом, как вы и делали.
-            #    Селектор ищет span, содержащий либо русский, либо английский текст.
             span_selector = f'span:has-text("{button_name_ru}"), span:has-text("{button_name_en}")'
             span_to_click = button_container.locator(span_selector)
 
-            # 4. Выполняем клик по span и ожидаем окно выбора файла.
             async with page.expect_file_chooser() as fc_info:
                 await span_to_click.nth(1).click()
 
             file_chooser = await fc_info.value
             await file_chooser.set_files(download_path)
             
-            if message_text:
-                # --- ИЗМЕНЕНИЕ: Добавлена проверка на английский и русский язык для поля подписи ---
-                caption_selector = 'div[aria-label*="Добавить подпись"], div[aria-label*="Add a caption"]'
-                await page.wait_for_selector(caption_selector, timeout=15000)
-                await page.locator(caption_selector).fill(message_text)
-                await take_screenshot(page, "sendfile_caption_filled")
+            # --- ИЗМЕНЕНИЕ: Логика для подписи к файлу полностью удалена ---
 
-            # --- ИЗМЕНЕНИЕ: Добавлена проверка на английский и русский язык для кнопки "Отправить" ---
             send_button_selector = '[aria-label="Отправить"], [aria-label="Send"]'
             await page.locator(send_button_selector).click(timeout=60000)
             
@@ -318,12 +368,10 @@ async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
         elif message_text:
             await msg_status.edit_text(f"Отправляю сообщение в '{chat_name}'...")
-            # --- ИЗМЕНЕНИЕ: Добавлена проверка на английский и русский язык для поля ввода сообщения ---
             msg_box_selector = 'div[aria-placeholder="Введите сообщение"], div[aria-placeholder="Type a message"]'
             await page.locator(msg_box_selector).fill(message_text)
             await take_screenshot(page, "send_message_filled")
             
-            # --- ИЗМЕНЕНИЕ: Добавлена проверка на английский и русский язык для кнопки "Отправить" ---
             send_button_selector = '[aria-label="Отправить"], [aria-label="Send"]'
             await page.locator(send_button_selector).click()
             await msg_status.edit_text("✅ Сообщение успешно отправлено!")
@@ -333,12 +381,10 @@ async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await msg_status.edit_text(f"❌ Не удалось отправить: {e}")
         await take_screenshot(page, "send_universal_error")
     finally:
-        # --- ИЗМЕНЕНИЕ: Блок для сброса состояния и очистки ---
         logger.info("Сброс состояния: возврат на главную страницу WhatsApp.")
         try:
             await asyncio.sleep(5)
             await take_screenshot(page, "wap_before_updating")
-            # Возвращаемся на главный экран, чтобы следующая команда началась с чистого листа
             await page.goto("https://web.whatsapp.com/", wait_until="domcontentloaded", timeout=15000)
             await asyncio.sleep(1) # Даем странице мгновение на прогрузку
         except Exception as e:
@@ -349,6 +395,14 @@ async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if download_path and os.path.exists(download_path):
             os.remove(download_path)
             logger.info(f"Временный файл удален: {download_path}")
+
+
+# Обертка для send_command, чтобы сначала проверить лимит
+async def send_command_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await check_and_request_support(update, context):
+        return
+    await send_command_internal(update, context)
+
 
 # --- MAIN ---
 
@@ -362,12 +416,14 @@ def main() -> None:
     send_handler = MessageHandler(
         (filters.TEXT & filters.Regex(r'^/send')) | 
         (filters.ATTACHMENT & filters.CaptionRegex(r'^/send')),
-        send_command
+        send_command_wrapper # Используем обертку
     )
 
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("login", login))
     application.add_handler(send_handler)
+    # --- НОВОЕ: Добавляем обработчик для кнопки сброса счетчика ---
+    application.add_handler(CallbackQueryHandler(reset_support_counter_callback, pattern='^reset_support_counter$'))
     
     logger.info("Бот запущен...")
     application.run_polling()
