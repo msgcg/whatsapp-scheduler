@@ -9,7 +9,7 @@ import logging
 import io
 import datetime
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Document
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -231,7 +231,7 @@ async def login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
             # Удаляем старое сообщение и отправляем QR-картинку
             await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=msg.message_id)
-            qr_msg = await update.message.reply_photo(
+            await update.message.reply_photo(
                 photo=io.BytesIO(qr_code_screenshot),
                 caption="Отсканируйте QR-код с помощью приложения WhatsApp. У вас есть 60 секунд."
             )
@@ -278,10 +278,18 @@ async def send_command_internal(update: Update, context: ContextTypes.DEFAULT_TY
 
         # --- ИЗМЕНЕНИЕ: Раздельная проверка для файла и текста ---
         if attachment: # Логика для файла
-            if len(args) != 2:
+            if isinstance(attachment, tuple):  # фото
                 await message.reply_text(
-                    "Неверный формат для файла. Прикрепите файл и в подписи укажите:\n"
+                    "⚠️ Фото можно отправлять **только как файлы**.\n"
+                    "Пожалуйста, используйте опцию 'Отправить как файл' в Telegram и подпишите:\n"
                     "`/send \"Имя чата\"`",
+                    parse_mode='Markdown'
+                )
+                return
+
+            if not isinstance(attachment, Document):
+                await message.reply_text(
+                    "⚠️ Неподдерживаемый тип файла. Отправляйте только документы.",
                     parse_mode='Markdown'
                 )
                 return
@@ -321,9 +329,15 @@ async def send_command_internal(update: Update, context: ContextTypes.DEFAULT_TY
     try:
         if attachment:
             await msg_status.edit_text("Подготовка файла к отправке...")
-            file_id = attachment.file_id
+
+            # --- ИЗМЕНЕНИЕ: Получаем нужный объект файла из кортежа ---
+            # Если это фото (кортеж), берем последнее (самое качественное)
+            file_to_download = attachment[-1] if isinstance(attachment, tuple) else attachment
+
+            file_id = file_to_download.file_id
             tg_file = await context.bot.get_file(file_id)
-            file_name = getattr(attachment, 'file_name', f"{attachment.file_unique_id}.jpg")
+            # У PhotoSize нет file_name, поэтому оставляем логику с getattr и file_unique_id
+            file_name = getattr(file_to_download, 'file_name', f"{file_to_download.file_unique_id}.jpg")
             
             download_path = os.path.join("temp_files", file_name)
             os.makedirs("temp_files", exist_ok=True)
@@ -338,13 +352,8 @@ async def send_command_internal(update: Update, context: ContextTypes.DEFAULT_TY
             await asyncio.sleep(2)
             await take_screenshot(page, "sendfile_attach_menu_fully_visible")
             
-            file_type = getattr(attachment, 'mime_type', '').lower()
-            if 'image' in file_type or 'video' in file_type:
-                button_name_ru = "Фото и видео"
-                button_name_en = "Photos & videos"
-            else:
-                button_name_ru = "Документ"
-                button_name_en = "Document"
+            button_name_ru = "Документ"
+            button_name_en = "Document"
 
             button_container = page.get_by_role("button", name=re.compile(f"^({button_name_ru}|{button_name_en})$"))
             span_selector = f'span:has-text("{button_name_ru}"), span:has-text("{button_name_en}")'
@@ -361,7 +370,7 @@ async def send_command_internal(update: Update, context: ContextTypes.DEFAULT_TY
             send_button_selector = '[aria-label="Отправить"], [aria-label="Send"]'
             await page.locator(send_button_selector).click(timeout=60000)
             
-            await msg_status.edit_text("✅ Файл успешно отправлен!")
+            await msg_status.edit_text("✅ Файл успешно отправлен! Из-за ограничений сервера нам придется подождать, чтобы отправить следующий файл")
 
             if os.path.exists(download_path):
                 os.remove(download_path)
@@ -374,7 +383,7 @@ async def send_command_internal(update: Update, context: ContextTypes.DEFAULT_TY
             
             send_button_selector = '[aria-label="Отправить"], [aria-label="Send"]'
             await page.locator(send_button_selector).click()
-            await msg_status.edit_text("✅ Сообщение успешно отправлено!")
+            await msg_status.edit_text("✅ Сообщение успешно отправлено! Из-за ограничений сервера нам придется подождать, чтобы отправить следующее сообщение")
 
     except Exception as e:
         logger.error(f"Ошибка при отправке: {e}")
@@ -382,15 +391,53 @@ async def send_command_internal(update: Update, context: ContextTypes.DEFAULT_TY
         await take_screenshot(page, "send_universal_error")
     finally:
         logger.info("Сброс состояния: возврат на главную страницу WhatsApp.")
+        
+        timer_msg = None # Инициализируем переменную для сообщения с таймером
         try:
-            await asyncio.sleep(5)
+            # --- НОВЫЙ БЛОК: Таймер с обновлением сообщения ---
+            total_duration = 10  # Общее время ожидания в секундах
+            update_interval = 2    # Как часто обновлять сообщение (в секундах)
+
+            # Отправляем начальное сообщение и сохраняем его
+            timer_msg = await update.effective_message.reply_text(
+                f"⏳ Сбрасываю состояние WhatsApp для отправки нового сообщения через {total_duration} сек..."
+            )
+
+            # Запускаем цикл обратного отсчета
+            for i in range(total_duration, 0, -1):
+                # Обновляем сообщение каждые `update_interval` секунд
+                if i % update_interval == 0:
+                    try:
+                        await timer_msg.edit_text(f"⏳ Сбрасываю состояние WhatsApp для отправки нового сообщения через {i} сек...")
+                    except Exception as e:
+                        # Игнорируем ошибки, если сообщение не изменилось или удалено
+                        if "message is not modified" not in str(e).lower():
+                            logger.warning(f"Не удалось обновить таймер: {e}")
+                
+                await asyncio.sleep(1) # Ждем 1 секунду
+            
+            # Сообщение перед самим действием
+            await timer_msg.edit_text("🔄 Выполняю сброс состояния...")
+            # --- КОНЕЦ БЛОКА ТАЙМЕРА ---
+            
             await take_screenshot(page, "wap_before_updating")
+            # Возвращаемся на главный экран
             await page.goto("https://web.whatsapp.com/", wait_until="domcontentloaded", timeout=15000)
-            await asyncio.sleep(1) # Даем странице мгновение на прогрузку
+            await asyncio.sleep(1) 
+            
+            # Удаляем сообщение с таймером после успешного выполнения
+            await timer_msg.delete()
+
         except Exception as e:
             logger.error(f"Не удалось вернуться на главную страницу: {e}")
             # Если даже это не удалось, возможно, браузер "умер", лучше перезапустить
             await get_whatsapp_page(context, force_new=True)
+            if timer_msg:
+                await timer_msg.edit_text("❌ Ошибка при сбросе состояния.")
+
+        if download_path and os.path.exists(download_path):
+            os.remove(download_path)
+            logger.info(f"Временный файл удален: {download_path}")
 
         if download_path and os.path.exists(download_path):
             os.remove(download_path)
