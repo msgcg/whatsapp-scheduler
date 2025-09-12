@@ -1,0 +1,8 @@
+.env
+playwright_state.json
+authorized_users.json
+whatsapp_qr.png
+__pycache__/
+*.pyc
+venv/
+debug_screenshots/
