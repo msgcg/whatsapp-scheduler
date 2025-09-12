@@ -7,6 +7,7 @@ import functools
 import logging
 import io
 import datetime
+import time
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Document
 from telegram.ext import (
@@ -32,7 +33,7 @@ SUPPORT_URL = "https://rest-check.onrender.com/"
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.WARNING #замените на DEBUG, чтобы увидеть все сообщения
+    level=logging.INFO #замените на DEBUG, чтобы увидеть все сообщения
 )
 logger = logging.getLogger(__name__)
 
@@ -159,7 +160,7 @@ async def get_whatsapp_page(context: ContextTypes.DEFAULT_TYPE, force_new: bool 
 async def check_login_status(page: Page) -> bool:
     try:
         search_box_selector = 'div[aria-placeholder="Поиск или новый чат"], div[aria-placeholder="Search or start a new chat"]'
-        await page.wait_for_selector(search_box_selector, timeout=5000)
+        await page.wait_for_selector(search_box_selector, timeout=60000)
         await take_screenshot(page, "login_success")
         logger.info("Сессия WhatsApp активна.")
         return True
@@ -176,7 +177,7 @@ async def find_and_click_chat(page: Page, chat_name: str) -> bool:
         await asyncio.sleep(1)
         
         chat_title_selector = f'span[title="{chat_name}"]'
-        await page.wait_for_selector(chat_title_selector, timeout=5000)
+        await page.wait_for_selector(chat_title_selector, timeout=60000)
         
         chat_container = page.locator(f'div[role="listitem"]:has({chat_title_selector})')
         await chat_container.click()
@@ -216,7 +217,7 @@ async def login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     try:
         await msg.edit_text("🔄 Переход на WhatsApp Web...")
-        await page.goto("https://web.whatsapp.com/", timeout=15000)
+        await page.goto("https://web.whatsapp.com/", timeout=60000)
         await take_screenshot(page, "login_goto")
 
         qr_selector = 'canvas[aria-label="Scan this QR code to link a device!"]'
@@ -224,7 +225,7 @@ async def login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         try:
             # Ждем QR
-            await page.wait_for_selector(qr_selector, timeout=15000)
+            await page.wait_for_selector(qr_selector, timeout=60000)
             await msg.edit_text("📷 Найден QR-код. Отправляю...")
 
             qr_element = page.locator(qr_selector)
@@ -332,47 +333,57 @@ async def send_command_internal(update: Update, context: ContextTypes.DEFAULT_TY
         if attachment:
             await msg_status.edit_text("Подготовка файла к отправке...")
 
-            # --- ИЗМЕНЕНИЕ: Получаем нужный объект файла из кортежа ---
-            # Если это фото (кортеж), берем последнее (самое качественное)
+            # --- Получаем правильный объект файла ---
             file_to_download = attachment[-1] if isinstance(attachment, tuple) else attachment
-
             file_id = file_to_download.file_id
             tg_file = await context.bot.get_file(file_id)
-            # У PhotoSize нет file_name, поэтому оставляем логику с getattr и file_unique_id
             file_name = getattr(file_to_download, 'file_name', f"{file_to_download.file_unique_id}.jpg")
-            
+
             download_path = os.path.join("temp_files", file_name)
             os.makedirs("temp_files", exist_ok=True)
             await tg_file.download_to_drive(custom_path=download_path)
 
+            # Считаем количество сообщений "доставлено" до отправки
+            delivered_selector = 'span[aria-label=" Доставлено "], span[aria-label=" Delivered "]'
+            before_count = await page.locator(delivered_selector).count()
+            logger.info(f"Количество сообщений до отправки: {before_count}")
+
             await msg_status.edit_text(f"Отправляю файл '{file_name}' в '{chat_name}'...")
-            
+
+            # Нажимаем «Прикрепить»
             attach_button_selector = '[aria-label="Прикрепить"], [aria-label="Attach"]'
             await page.locator(attach_button_selector).click()
-            
-            logger.info("Ожидание анимации меню вложения...")
-            await asyncio.sleep(2)
-            await take_screenshot(page, "sendfile_attach_menu_fully_visible")
-            
-            button_name_ru = "Документ"
-            button_name_en = "Document"
+            await asyncio.sleep(2)  # ждём анимацию меню
 
-            button_container = page.get_by_role("button", name=re.compile(f"^({button_name_ru}|{button_name_en})$"))
-            span_selector = f'span:has-text("{button_name_ru}"), span:has-text("{button_name_en}")'
-            span_to_click = button_container.locator(span_selector)
+            # Жмём «Документ»
+            button_container = page.get_by_role("button", name=re.compile("^(Документ|Document)$"))
+            span_to_click = button_container.locator('span:has-text("Документ"), span:has-text("Document")')
 
             async with page.expect_file_chooser() as fc_info:
                 await span_to_click.nth(1).click()
-
             file_chooser = await fc_info.value
             await file_chooser.set_files(download_path)
-            
-            # --- ИЗМЕНЕНИЕ: Логика для подписи к файлу полностью удалена ---
 
+            # Жмём «Отправить»
             send_button_selector = '[aria-label="Отправить"], [aria-label="Send"]'
             await page.locator(send_button_selector).click(timeout=60000)
-            
-            await msg_status.edit_text("✅ Файл успешно отправлен! Из-за ограничений сервера нам придется подождать, чтобы отправить следующий файл")
+
+            # Ждём доставки (увеличение delivered-иконок)
+            try:
+                await page.wait_for_function(
+                    """(selector, before) => {
+                        const elements = document.querySelectorAll(selector);
+                        return elements.length > before;
+                    }""",
+                    (delivered_selector, before_count),
+                    timeout=60000
+                )
+                await msg_status.edit_text(
+                    "✅ Файл успешно отправлен и доставлен! "
+                    "Из-за ограничений сервера придётся подождать перед отправкой следующего файла."
+                )
+            except TimeoutError:
+                await msg_status.edit_text("⚠️ Файл отправлен, но не удалось дождаться подтверждения доставки.")
 
             if os.path.exists(download_path):
                 os.remove(download_path)
@@ -381,11 +392,29 @@ async def send_command_internal(update: Update, context: ContextTypes.DEFAULT_TY
             await msg_status.edit_text(f"Отправляю сообщение в '{chat_name}'...")
             msg_box_selector = 'div[aria-placeholder="Введите сообщение"], div[aria-placeholder="Type a message"]'
             await page.locator(msg_box_selector).fill(message_text)
-            await take_screenshot(page, "send_message_filled")
-            
+
             send_button_selector = '[aria-label="Отправить"], [aria-label="Send"]'
             await page.locator(send_button_selector).click()
-            await msg_status.edit_text("✅ Сообщение успешно отправлено! Из-за ограничений сервера нам придется подождать, чтобы отправить следующее сообщение")
+
+            # Для текста можно сделать такую же проверку доставки
+            try:
+                delivered_selector = 'span[aria-label=" Доставлено "], span[aria-label=" Delivered "]'
+                before_count = await page.locator(delivered_selector).count()
+                await page.wait_for_function(
+                    """(selector, before) => {
+                        const elements = document.querySelectorAll(selector);
+                        return elements.length > before;
+                    }""",
+                    (delivered_selector, before_count),
+                    timeout=60000
+                )
+                await msg_status.edit_text(
+                    "✅ Сообщение успешно отправлено и доставлено! "
+                    "Из-за ограничений сервера придётся подождать перед отправкой следующего сообщения."
+                )
+            except TimeoutError:
+                await msg_status.edit_text("⚠️ Сообщение отправлено, но не удалось дождаться подтверждения доставки.")
+
 
     except Exception as e:
         logger.error(f"Ошибка при отправке: {e}")
@@ -396,39 +425,39 @@ async def send_command_internal(update: Update, context: ContextTypes.DEFAULT_TY
         
         timer_msg = None # Инициализируем переменную для сообщения с таймером
         try:
-            # --- НОВЫЙ БЛОК: Таймер с обновлением сообщения ---
-            total_duration = 10  # Общее время ожидания в секундах
-            update_interval = 2    # Как часто обновлять сообщение (в секундах)
 
-            # Отправляем начальное сообщение и сохраняем его
+            total_duration = 10
+            update_interval = 2
+
+            start_time = time.monotonic()  # реальное время старта
+            end_time = start_time + total_duration
+
             timer_msg = await update.effective_message.reply_text(
                 f"⏳ Сбрасываю состояние WhatsApp для отправки нового сообщения через {total_duration} сек..."
             )
 
-            # Запускаем цикл обратного отсчета
-            for i in range(total_duration, 0, -1):
-                # Обновляем сообщение каждые `update_interval` секунд
-                if i % update_interval == 0:
+            while True:
+                remaining = int(end_time - time.monotonic())
+                if remaining <= 0:
+                    await timer_msg.edit_text("🔄 Выполняю сброс состояния...")
+                    await take_screenshot(page, "wap_before_updating")
+                    await page.goto("https://web.whatsapp.com/", wait_until="domcontentloaded", timeout=15000)
+                    await asyncio.sleep(1)
+                    await timer_msg.delete()
+                    break
+
+                # обновляем каждые update_interval секунд
+                if remaining % update_interval == 0:
                     try:
-                        await timer_msg.edit_text(f"⏳ Сбрасываю состояние WhatsApp для отправки нового сообщения через {i} сек...")
+                        await timer_msg.edit_text(
+                            f"⏳ Сбрасываю состояние WhatsApp для отправки нового сообщения через {remaining} сек..."
+                        )
                     except Exception as e:
-                        # Игнорируем ошибки, если сообщение не изменилось или удалено
                         if "message is not modified" not in str(e).lower():
                             logger.warning(f"Не удалось обновить таймер: {e}")
-                
-                await asyncio.sleep(1) # Ждем 1 секунду
-            
-            # Сообщение перед самим действием
-            await timer_msg.edit_text("🔄 Выполняю сброс состояния...")
-            # --- КОНЕЦ БЛОКА ТАЙМЕРА ---
-            
-            await take_screenshot(page, "wap_before_updating")
-            # Возвращаемся на главный экран
-            await page.goto("https://web.whatsapp.com/", wait_until="domcontentloaded", timeout=15000)
-            await asyncio.sleep(1) 
-            
-            # Удаляем сообщение с таймером после успешного выполнения
-            await timer_msg.delete()
+
+                await asyncio.sleep(1)
+
 
         except Exception as e:
             logger.error(f"Не удалось вернуться на главную страницу: {e}")
