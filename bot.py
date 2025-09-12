@@ -371,11 +371,11 @@ async def send_command_internal(update: Update, context: ContextTypes.DEFAULT_TY
             # Ждём доставки (увеличение delivered-иконок)
             try:
                 await page.wait_for_function(
-                    """(selector, before) => {
+                    """([selector, before]) => {
                         const elements = document.querySelectorAll(selector);
                         return elements.length > before;
                     }""",
-                    (delivered_selector, before_count),
+                    arg=(delivered_selector, before_count),
                     timeout=60000
                 )
                 await msg_status.edit_text(
@@ -401,11 +401,11 @@ async def send_command_internal(update: Update, context: ContextTypes.DEFAULT_TY
                 delivered_selector = 'span[aria-label=" Доставлено "], span[aria-label=" Delivered "]'
                 before_count = await page.locator(delivered_selector).count()
                 await page.wait_for_function(
-                    """(selector, before) => {
+                    """([selector, before]) => {
                         const elements = document.querySelectorAll(selector);
                         return elements.length > before;
                     }""",
-                    (delivered_selector, before_count),
+                    arg=(delivered_selector, before_count),
                     timeout=60000
                 )
                 await msg_status.edit_text(
