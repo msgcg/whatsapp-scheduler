@@ -27,6 +27,7 @@ logging.getLogger("telegram").setLevel(logging.WARNING)
 
 Публичная версия этого бота размещена по адресу: [https://t.me/whatsapp_shedbot](https://t.me/whatsapp_shedbot).
 
+Политика конфиденциальности: [https://oneserver.servehttp.com/whatsapp-shed-policy/](https://oneserver.servehttp.com/whatsapp-shed-policy/)
 ## Поддержка бота
 
 Бот поддерживается за счет разработчика. Пожалуйста, поддержите проект, посетив сайт https://rest-check.onrender.com/ и посмотрев рекламные ролики. Там же вы найдете удобный инструмент для разделения счета из ресторанов. Спасибо!
