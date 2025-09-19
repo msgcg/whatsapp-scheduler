@@ -1,6 +1,7 @@
 .env
 playwright_state.json
 authorized_users.json
+whatsapp_snapshot.html
 whatsapp_qr.png
 __pycache__/
 *.pyc
