@@ -119,7 +119,7 @@ async def take_screenshot(page: Page, name: str):
          logger.error(f"Не удалось сохранить скриншот '{name}': {e}")
 
 
-async def get_whatsapp_page(context: ContextTypes.DEFAULT_TYPE, user_id: int, force_new: bool = False) -> Page | None:
+async def get_whatsapp_page(context: ContextTypes.DEFAULT_TYPE, user_id: int, force_new: bool = False, force_no_locale: bool = False) -> Page | None:
     user_data = context.user_data
 
     # Флаг для определения, нужна ли полная переинициализация Playwright
@@ -143,14 +143,27 @@ async def get_whatsapp_page(context: ContextTypes.DEFAULT_TYPE, user_id: int, fo
             p = await async_playwright().start()
             browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled'])
             user_data['browser'] = browser
+            
             user_state_path = get_user_state_path(user_id)
-            storage_state = user_state_path if os.path.exists(user_state_path) else None
+            user_state_exists = os.path.exists(user_state_path)
 
-            pw_context = await browser.new_context(
-                storage_state=storage_state,
-                locale="ru-RU",
-                user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            )
+            context_options = {
+                "storage_state": user_state_path if user_state_exists else None,
+                "user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            }
+
+            # --- ИЗМЕНЕННАЯ ЛОГИКА ---
+            # Устанавливаем локаль, только если сессия существует И НЕТ флага принудительного отключения
+            if user_state_exists and not force_no_locale:
+                logger.info(f"Найден файл сессии для {user_id}. Установка локали 'ru-RU'.")
+                context_options["locale"] = "ru-RU"
+            else:
+                if force_no_locale:
+                    logger.warning(f"Принудительный запуск без локали для пользователя {user_id}.")
+                else:
+                    logger.info(f"Файл сессии для {user_id} не найден. Контекст создается без локали.")
+
+            pw_context = await browser.new_context(**context_options)
             user_data['playwright_context'] = pw_context
 
             page = await pw_context.new_page()
@@ -160,7 +173,7 @@ async def get_whatsapp_page(context: ContextTypes.DEFAULT_TYPE, user_id: int, fo
             logger.error(f"Не удалось запустить Playwright для пользователя {user_id}: {e}")
             return None
     else:
-        # Если браузер и контекст существуют и действительны, пытаемся использовать существующую страницу или создать новую
+        # Этот блок остается без изменений
         pw_context = user_data['playwright_context']
         page = user_data.get('whatsapp_page')
 
@@ -175,9 +188,48 @@ async def get_whatsapp_page(context: ContextTypes.DEFAULT_TYPE, user_id: int, fo
             return page
         except Exception as e:
             logger.error(f"Не удалось создать новую страницу Playwright для пользователя {user_id} в существующем контексте: {e}")
-            # Если создание новой страницы не удалось, это может указывать на проблему с контекстом, поэтому принудительно переинициализируем
             logger.info("Попытка полной переинициализации Playwright для пользователя %s из-за ошибки создания страницы.", user_id)
-            return await get_whatsapp_page(context, user_id, force_new=True) # Рекурсивный вызов с force_new=True
+            return await get_whatsapp_page(context, user_id, force_new=True)
+
+async def smart_check_and_get_page(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> Page | None:
+    """
+    "Умная" функция, которая сначала пытается получить страницу с русской локалью (если есть сессия),
+    а в случае неудачи (не найден элемент чатов), перезапускает браузер без локали.
+    """
+    # --- Попытка №1: Оптимистичная, с локалью ---
+    logger.info(f"Умная проверка для {user_id}: Попытка №1 (с локалью, если есть сессия).")
+    page = await get_whatsapp_page(context, user_id)
+    if not page:
+        return None # Если браузер вообще не запустился
+
+    try:
+        await page.goto("https://web.whatsapp.com/", timeout=45000)
+        if await check_login_status(page):
+            logger.info(f"Умная проверка для {user_id}: Попытка №1 успешна, сессия активна.")
+            return page # Все хорошо, сессия активна, возвращаем страницу
+    except TimeoutError:
+        logger.warning(f"Умная проверка для {user_id}: Не удалось загрузить страницу за 45 секунд.")
+    except Exception as e:
+        logger.error(f"Умная проверка для {user_id}: Ошибка на Попытке №1: {e}")
+
+
+    # --- Попытка №2: Восстановление, без локали ---
+    logger.warning(f"Умная проверка для {user_id}: Попытка №1 не удалась. Запускаю Попытку №2 (принудительно без локали).")
+    await take_screenshot(page, "smart_check_failed_attempt_1")
+
+    # Перезапускаем браузер с флагом force_no_locale
+    page = await get_whatsapp_page(context, user_id, force_new=True, force_no_locale=True)
+    if not page:
+        return None
+
+    try:
+        await page.goto("https://web.whatsapp.com/", timeout=60000)
+        logger.info(f"Умная проверка для {user_id}: Попытка №2 (без локали) завершена. Возвращаем страницу для дальнейшей обработки.")
+        return page # Возвращаем страницу, какой бы она ни была (с QR или уже залогиненной)
+    except Exception as e:
+        logger.error(f"Умная проверка для {user_id}: Критическая ошибка на Попытке №2: {e}")
+        await take_screenshot(page, "smart_check_failed_attempt_2")
+        return None
 
 async def check_login_status(page: Page) -> bool:
     try:
@@ -230,77 +282,57 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 @command_wrapper
 async def login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    force_new = 'new' in (context.args or [])
-    msg = await update.message.reply_text("🔄 Инициализация браузера...")
-    page = await get_whatsapp_page(context, update.effective_user.id, force_new=force_new)
+    msg = await update.message.reply_text("🔄 Запускаю умную проверку сессии...")
+
+    page = await smart_check_and_get_page(context, update.effective_user.id)
     if not page:
-        await msg.edit_text("❌ Не удалось запустить браузер. Попробуйте снова.")
+        await msg.edit_text("❌ Не удалось запустить браузер после нескольких попыток. Попробуйте снова.")
         return
 
     try:
-        await msg.edit_text("🔄 Переход на WhatsApp Web (ждите, это долго)...")
-        await page.goto("https://web.whatsapp.com/", timeout=60000)
-        await take_screenshot(page, "login_goto")
-        
-        # --- НАЧАЛО ИЗМЕНЕНИЯ ---
+        # Проверяем, может после всех манипуляций мы уже залогинены
+        if await check_login_status(page):
+            await msg.edit_text("✅ Вы уже вошли в WhatsApp. Сессия активна.")
+            await take_screenshot(page, "login_already_logged_in")
+            # Сохраним сессию на всякий случай, если она обновилась
+            user_state_path = get_user_state_path(update.effective_user.id)
+            await context.user_data['playwright_context'].storage_state(path=user_state_path)
+            return
 
-        # Определяем селекторы
+        # Если мы здесь, значит, сессия неактивна и мы должны искать QR-код
+        await msg.edit_text("Сессия неактивна. Ищу QR-код...")
         qr_selector = 'canvas[aria-label="Scan this QR code to link a device!"]'
-        chat_list_selector = 'div[aria-placeholder="Поиск или новый чат"], div[aria-placeholder="Search or start a new chat"]'
-        # Селектор для SVG иконки WhatsApp, которая появляется перед QR-кодом
-        whatsapp_icon_selector = 'svg[viewBox="0 0 64 64"]'
-
+        
         try:
-            # 1. Сначала ждем появления логотипа WhatsApp как индикатора загрузки
-            await msg.edit_text("Загрузка страницы... Ожидание логотипа WhatsApp...")
-            await page.wait_for_selector(whatsapp_icon_selector, timeout=60000)
-            logger.info("Логотип WhatsApp найден. Страница загружена.")
-
-            # 2. Теперь, когда страница загружена, ждем сам QR-код
-            await msg.edit_text("Логотип найден! Ожидание QR-кода...")
-            # Таймаут здесь можно сделать меньше, т.к. мы уже знаем, что страница активна
-            await page.wait_for_selector(qr_selector, timeout=20000) 
-            
+            # Ждем QR-код
+            await page.wait_for_selector(qr_selector, timeout=30000)
             await msg.edit_text("📷 Найден QR-код. Отправляю...")
 
             qr_element = page.locator(qr_selector)
             await take_screenshot(page, "login_qr_found")
             qr_code_screenshot = await qr_element.screenshot()
 
-            # Удаляем старое сообщение и отправляем QR-картинку
+            # Отправляем QR-картинку
             await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=msg.message_id)
             await update.message.reply_photo(
                 photo=io.BytesIO(qr_code_screenshot),
                 caption="Отсканируйте QR-код с помощью приложения WhatsApp. У вас есть 60 секунд."
             )
 
-            # Ждем появления списка чатов
-            try:
-                await page.wait_for_selector(chat_list_selector, timeout=60000)
-                await take_screenshot(page, "login_success")
-                user_state_path = get_user_state_path(update.effective_user.id)
-                await context.user_data['playwright_context'].storage_state(path=user_state_path)
-                logger.info(f"Состояние сессии сохранено для пользователя {update.effective_user.id}.")
-                await update.message.reply_text("✅ Вход выполнен успешно! Сессия сохранена.")
-
-            except TimeoutError:
-                await take_screenshot(page, "login_timeout")
-                await update.message.reply_text("❌ Не удалось найти список чатов. Сессия может быть неактивной.")
-
-        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+            # Ждем входа в систему после сканирования
+            chat_list_selector = 'div[aria-placeholder="Поиск или новый чат"], div[aria-placeholder="Search or start a new chat"]'
+            await page.wait_for_selector(chat_list_selector, timeout=60000)
+            await take_screenshot(page, "login_success")
+            
+            # Сохраняем успешную сессию
+            user_state_path = get_user_state_path(update.effective_user.id)
+            await context.user_data['playwright_context'].storage_state(path=user_state_path)
+            logger.info(f"Состояние сессии сохранено для пользователя {update.effective_user.id}.")
+            await update.message.reply_text("✅ Вход выполнен успешно! Сессия сохранена.")
 
         except TimeoutError:
-            # Если QR не появился — проверяем, может уже вошли
-            if await check_login_status(page):
-                await msg.edit_text("✅ Вы уже вошли в WhatsApp. Сессия активна.")
-                await take_screenshot(page, "login_already_logged_in")
-            else:
-                await take_screenshot(page, "login_error")
-                await msg.edit_text("❌ Не удалось найти QR-код или вход не удался. Попробуйте снова.")
-                html_content = await page.content()
-                with open("whatsapp_snapshot.html", "w", encoding="utf-8") as f:
-                    f.write(html_content)
-                logger.debug("Снапшот HTML 'whatsapp_snapshot.html' сохранен.")
+            await take_screenshot(page, "login_qr_timeout")
+            await msg.edit_text("❌ Не удалось найти QR-код. Возможно, страница не загрузилась. Попробуйте /login снова.")
 
     except Exception as e:
         logger.error(f"Произошла ошибка при входе: {e}")
@@ -359,10 +391,24 @@ async def send_command_internal(update: Update, context: ContextTypes.DEFAULT_TY
     context.user_data['request_count'] = context.user_data.get('request_count', 0) + 1
     logger.info(f"Счетчик команд для {update.effective_user.id} увеличен до {context.user_data['request_count']}")
 
-    msg_status = await message.reply_text("🔄 Проверяю сессию WhatsApp...")
-    page = await get_whatsapp_page(context, update.effective_user.id)
-    if not page or not await check_login_status(page):
+    msg_status = await update.effective_message.reply_text("🔄 Проверяю сессию WhatsApp...")
+    page = await get_whatsapp_page(context, update.effective_user.id) # Здесь используем обычный get, т.к. не хотим перезапускать для отправки
+    
+    if not page:
+        await msg_status.edit_text("❌ Не удалось инициализировать браузер. Попробуйте /login.")
+        return
+
+    try:
+        await page.goto("https://web.whatsapp.com/", wait_until="domcontentloaded", timeout=30000)
+    except TimeoutError:
+        # Если страница даже не грузится, то сессии точно нет
+        logger.warning("Таймаут при загрузке страницы в send_command_internal.")
+        # Ниже check_login_status вернет False
+
+    if not await check_login_status(page):
         await msg_status.edit_text("❌ Вы не вошли в WhatsApp. Пожалуйста, используйте команду /login.")
+        # Можно даже принудительно перезапустить браузер без локали, чтобы следующий /login сработал быстрее
+        await get_whatsapp_page(context, update.effective_user.id, force_new=True, force_no_locale=True)
         return
 
     await msg_status.edit_text(f"Ищу чат '{chat_name}'...")
