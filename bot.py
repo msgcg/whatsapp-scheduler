@@ -151,7 +151,7 @@ async def get_whatsapp_page(context: ContextTypes.DEFAULT_TYPE, user_id: int, fo
 
             pw_context = await browser.new_context(
                 storage_state=storage_state,
-                locale="ru-RU",
+                #locale="ru-RU",
                 user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             )
             user_data['playwright_context'] = pw_context
