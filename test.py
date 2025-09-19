@@ -241,12 +241,26 @@ async def login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await msg.edit_text("🔄 Переход на WhatsApp Web (ждите, это долго)...")
         await page.goto("https://web.whatsapp.com/", timeout=60000)
         await take_screenshot(page, "login_goto")
+        
+        # --- НАЧАЛО ИЗМЕНЕНИЯ ---
+
+        # Определяем селекторы
         qr_selector = 'canvas[aria-label="Scan this QR code to link a device!"]'
         chat_list_selector = 'div[aria-placeholder="Поиск или новый чат"], div[aria-placeholder="Search or start a new chat"]'
+        # Селектор для SVG иконки WhatsApp, которая появляется перед QR-кодом
+        whatsapp_icon_selector = 'svg[viewBox="0 0 64 64"]'
 
         try:
-            # Ждем QR
-            await page.wait_for_selector(qr_selector, timeout=60000)
+            # 1. Сначала ждем появления логотипа WhatsApp как индикатора загрузки
+            await msg.edit_text("Загрузка страницы... Ожидание логотипа WhatsApp...")
+            await page.wait_for_selector(whatsapp_icon_selector, timeout=60000)
+            logger.info("Логотип WhatsApp найден. Страница загружена.")
+
+            # 2. Теперь, когда страница загружена, ждем сам QR-код
+            await msg.edit_text("Логотип найден! Ожидание QR-кода...")
+            # Таймаут здесь можно сделать меньше, т.к. мы уже знаем, что страница активна
+            await page.wait_for_selector(qr_selector, timeout=20000) 
+            
             await msg.edit_text("📷 Найден QR-код. Отправляю...")
 
             qr_element = page.locator(qr_selector)
@@ -273,6 +287,7 @@ async def login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 await take_screenshot(page, "login_timeout")
                 await update.message.reply_text("❌ Не удалось найти список чатов. Сессия может быть неактивной.")
 
+        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
         except TimeoutError:
             # Если QR не появился — проверяем, может уже вошли
