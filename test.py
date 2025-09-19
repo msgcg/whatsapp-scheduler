@@ -241,10 +241,6 @@ async def login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await msg.edit_text("🔄 Переход на WhatsApp Web (ждите, это долго)...")
         await page.goto("https://web.whatsapp.com/", timeout=60000)
         await take_screenshot(page, "login_goto")
-        html_content = await page.content()
-        with open("whatsapp_snapshot.html", "w", encoding="utf-8") as f:
-            f.write(html_content)
-        logger.debug("Снапшот HTML 'whatsapp_snapshot.html' сохранен.")
         qr_selector = 'canvas[aria-label="Scan this QR code to link a device!"]'
         chat_list_selector = 'div[aria-placeholder="Поиск или новый чат"], div[aria-placeholder="Search or start a new chat"]'
 
@@ -286,6 +282,10 @@ async def login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             else:
                 await take_screenshot(page, "login_error")
                 await msg.edit_text("❌ Не удалось найти QR-код или вход не удался. Попробуйте снова.")
+                html_content = await page.content()
+                with open("whatsapp_snapshot.html", "w", encoding="utf-8") as f:
+                    f.write(html_content)
+                logger.debug("Снапшот HTML 'whatsapp_snapshot.html' сохранен.")
 
     except Exception as e:
         logger.error(f"Произошла ошибка при входе: {e}")
